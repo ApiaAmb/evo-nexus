@@ -1,7 +1,9 @@
 /**
  * ChatLogger — append-only JSONL logs for chat conversations.
  *
- * Stores chat messages in workspace/ADWs/logs/chat/{agentName}_{sessionId}.jsonl
+ * D5: Stores chat messages partitioned by user:
+ *   workspace/ADWs/logs/chat/users/<ownerUserId>/<agentName>/<sessionId>.jsonl
+ *
  * Each line is a JSON object: { role, text?, blocks?, files?, ts, uuid? }
  *
  * Special event lines:
@@ -11,6 +13,9 @@
  *
  * This is the durable source of truth for chat history.
  * sessions.json is a fast-access cache; JSONL survives restarts and cleanups.
+ *
+ * IMPORTANT: ownerUserId is required for all operations. Missing ownerUserId
+ * throws — no silent default to avoid cross-user data access.
  */
 
 const fs = require('fs');
@@ -19,33 +24,44 @@ const crypto = require('crypto');
 
 class ChatLogger {
   constructor(workspaceRoot) {
-    this.logsDir = path.join(workspaceRoot || process.cwd(), 'workspace', 'ADWs', 'logs', 'chat');
-    this._ensureDir();
+    this.logsRoot = path.join(workspaceRoot || process.cwd(), 'workspace', 'ADWs', 'logs', 'chat');
+    this._ensureDir(this.logsRoot);
   }
 
-  _ensureDir() {
+  _ensureDir(dir) {
     try {
-      fs.mkdirSync(this.logsDir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true });
     } catch {}
   }
 
-  _logPath(agentName, sessionId) {
+  // D5: partitioned path — logs/chat/users/<id>/<agentName>/<sessionId>.jsonl
+  _logPath(ownerUserId, agentName, sessionId) {
+    if (!ownerUserId) {
+      throw new Error(`[chat-logger] ownerUserId is required — refusing to read/write without owner`);
+    }
     const safe = (agentName || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
     const shortId = sessionId.slice(0, 8);
-    return path.join(this.logsDir, `${safe}_${shortId}.jsonl`);
+    const dir = path.join(this.logsRoot, 'users', String(ownerUserId), safe);
+    this._ensureDir(dir);
+    return path.join(dir, `${safe}_${shortId}.jsonl`);
   }
 
   /**
    * Append a message to the chat log.
    * Assigns a uuid if the message doesn't already have one.
    * Returns the (possibly assigned) uuid.
+   *
+   * @param {string|number} ownerUserId - Required. Owner of the session.
+   * @param {string} agentName
+   * @param {string} sessionId
+   * @param {object} message
    */
-  append(agentName, sessionId, message) {
+  append(ownerUserId, agentName, sessionId, message) {
     try {
       if (!message.uuid) {
         message.uuid = crypto.randomUUID();
       }
-      const logPath = this._logPath(agentName, sessionId);
+      const logPath = this._logPath(ownerUserId, agentName, sessionId);
       const line = JSON.stringify(message) + '\n';
       fs.appendFileSync(logPath, line, 'utf8');
       return message.uuid;
@@ -57,12 +73,16 @@ class ChatLogger {
 
   /**
    * Append a rewind marker to the JSONL log.
-   * The marker records which message uuid was rewound from.
+   *
+   * @param {string|number} ownerUserId - Required.
+   * @param {string} agentName
+   * @param {string} sessionId
+   * @param {string} atUuid
    */
-  appendRewindMarker(agentName, sessionId, atUuid) {
+  appendRewindMarker(ownerUserId, agentName, sessionId, atUuid) {
     try {
       const marker = { type: 'rewind', at: atUuid, ts: Date.now() };
-      const logPath = this._logPath(agentName, sessionId);
+      const logPath = this._logPath(ownerUserId, agentName, sessionId);
       fs.appendFileSync(logPath, JSON.stringify(marker) + '\n', 'utf8');
     } catch (err) {
       console.error(`[chat-logger] Failed to append rewind marker: ${err.message}`);
@@ -73,13 +93,13 @@ class ChatLogger {
    * Read full chat history from JSONL log, applying rewind markers.
    * Returns array of messages, or empty array if not found.
    *
-   * Algorithm: play forward. When a { type:"rewind", at:<uuid> } line is
-   * encountered, drop all messages strictly after the message with that uuid.
-   * Legacy messages without uuid get synthesized deterministic ids.
+   * @param {string|number} ownerUserId - Required.
+   * @param {string} agentName
+   * @param {string} sessionId
    */
-  read(agentName, sessionId) {
+  read(ownerUserId, agentName, sessionId) {
     try {
-      const logPath = this._logPath(agentName, sessionId);
+      const logPath = this._logPath(ownerUserId, agentName, sessionId);
       if (!fs.existsSync(logPath)) return [];
 
       const content = fs.readFileSync(logPath, 'utf8').trim();
@@ -108,12 +128,10 @@ class ChatLogger {
       const messages = [];
       for (const entry of rawLines) {
         if (entry.type === 'rewind') {
-          // Drop the message with entry.at uuid AND everything after it
           const cutIdx = messages.findIndex(m => m.uuid === entry.at);
           if (cutIdx !== -1) {
             messages.splice(cutIdx);
           }
-          // If uuid not found (e.g. marker for already-rewound content), no-op
         } else {
           messages.push(entry);
         }
@@ -128,9 +146,17 @@ class ChatLogger {
 
   /**
    * Check if a log exists for a session.
+   *
+   * @param {string|number} ownerUserId - Required.
+   * @param {string} agentName
+   * @param {string} sessionId
    */
-  exists(agentName, sessionId) {
-    return fs.existsSync(this._logPath(agentName, sessionId));
+  exists(ownerUserId, agentName, sessionId) {
+    try {
+      return fs.existsSync(this._logPath(ownerUserId, agentName, sessionId));
+    } catch {
+      return false;
+    }
   }
 }
 

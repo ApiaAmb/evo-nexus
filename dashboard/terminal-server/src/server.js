@@ -233,6 +233,7 @@ class TerminalServer {
       status,
       timestamp: new Date().toISOString(),
       uptime_seconds: Math.round(process.uptime()),
+      session_isolation_enabled: process.env.SESSION_ISOLATION_ENABLED !== 'false',
       counts: {
         claudeSessions: this.claudeSessions.size,
         activeSessions: Array.from(this.claudeSessions.values()).filter((s) => s.active).length,
@@ -695,7 +696,7 @@ class TerminalServer {
     this.wss.on('connection', (ws, req) => this.handleWebSocketConnection(ws, req));
 
     return new Promise((resolve, reject) => {
-      server.listen(this.port, '127.0.0.1', (err) => {
+      server.listen(this.port, '0.0.0.0', (err) => {
         if (err) return reject(err);
         this.server = server;
         resolve(server);

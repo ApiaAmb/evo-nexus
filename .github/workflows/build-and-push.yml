@@ -1,0 +1,67 @@
+name: Build and push dashboard image
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+      - 'feature/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag adicional além de :rc e :sha (ex: isolation-fix)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          BASE="cognitivaai/evo-nexus-dashboard"
+          TAGS="${BASE}:rc,${BASE}:sha-${SHORT_SHA}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAGS="${TAGS},${BASE}:${{ inputs.tag }}"
+          fi
+          BRANCH_TAG=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          TAGS="${TAGS},${BASE}:branch-${BRANCH_TAG}"
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "Computed tags: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.swarm.dashboard
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify deps in image (smoke check)
+        run: |
+          FIRST_TAG=$(echo "${{ steps.tags.outputs.tags }}" | cut -d',' -f1)
+          echo "Pulling ${FIRST_TAG} for verification..."
+          docker pull "${FIRST_TAG}"
+          docker run --rm "${FIRST_TAG}" /workspace/.venv/bin/python3 -c "
+          import gevent, geventwebsocket, psycogreen, websocket, gunicorn
+          print('gevent:', gevent.__version__)
+          print('gunicorn:', gunicorn.__version__)
+          print('All 5 critical deps imported OK')
+          "

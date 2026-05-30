@@ -278,8 +278,20 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
         setErrorMsg('WebSocket error')
       }
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         if (pingRef.current) { clearInterval(pingRef.current); pingRef.current = null }
+        if (cancelled) return
+        // Proxy close codes (D-W1 / D-W2)
+        if (ev.code === 4401) {
+          setStatus('error')
+          setErrorMsg('Sessão inválida — faça login novamente.')
+        } else if (ev.code === 4403) {
+          setStatus('error')
+          setErrorMsg('Acesso negado — origem não autorizada. Faça login novamente.')
+        } else if (ev.code === 4503) {
+          setStatus('error')
+          setErrorMsg('Terminal em manutenção. Tente novamente em alguns instantes.')
+        }
       }
 
       pingRef.current = setInterval(() => {

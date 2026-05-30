@@ -581,3 +581,38 @@ def verify_mcp_servers(
             status[effective_name] = "ok"
 
     return status
+
+
+# ---------------------------------------------------------------------------
+# gevent threadpool wrapper (D-W3, Raven r2 M-1)
+#
+# fcntl.flock(LOCK_EX) em _ClaudeJsonWriter.__enter__ é uma syscall
+# bloqueante de nível OS — gevent monkey-patch NÃO a torna cooperativa.
+# Sob GeventWebSocketWorker, a chamada trava o worker inteiro até o lock
+# ser obtido. Para operações de install/update de plugin (baixa frequência
+# mas potencialmente longas sob carga), envolver via gevent.threadpool
+# descarrega a espera para um OS thread real, liberando o event loop.
+#
+# run_in_threadpool(fn, *args, **kwargs):
+#   - Sob gevent: executa fn no threadpool, bloqueia a greenlet chamadora
+#     mas NÃO o event loop (outras greenlets continuam a rodar).
+#   - Sem gevent: executa fn diretamente (identidade).
+# ---------------------------------------------------------------------------
+
+
+def run_in_threadpool(fn, *args, **kwargs):
+    """Executa fn no gevent threadpool se disponível, senão diretamente.
+
+    Use para envolver chamadas que invocam _ClaudeJsonWriter sob
+    GeventWebSocketWorker (evita stall do event loop no flock bloqueante).
+    """
+    try:
+        from gevent.threadpool import ThreadPool  # type: ignore
+
+        pool = ThreadPool(1)
+        result = pool.spawn(fn, *args, **kwargs).get()
+        pool.kill()
+        return result
+    except ImportError:
+        # gevent não instalado — executa diretamente (modo dev/Werkzeug)
+        return fn(*args, **kwargs)

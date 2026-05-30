@@ -59,7 +59,7 @@ jobs:
           FIRST_TAG=$(echo "${{ steps.tags.outputs.tags }}" | cut -d',' -f1)
           echo "Pulling ${FIRST_TAG} for verification..."
           docker pull "${FIRST_TAG}"
-          docker run --rm "${FIRST_TAG}" python3 -c "
+          docker run --rm "${FIRST_TAG}" /workspace/.venv/bin/python3 -c "
           import gevent, geventwebsocket, psycogreen, websocket, gunicorn
           print('gevent:', gevent.__version__)
           print('gunicorn:', gunicorn.__version__)

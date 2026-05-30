@@ -1,3 +1,26 @@
+# ============================================================================
+# APIA AMB — fork patch (2026-05-29)
+#
+# Este workflow foi modificado em relacao ao upstream para publicar imagens
+# no GitHub Container Registry (ghcr.io) sob o namespace `apiaamb`, em vez
+# do Docker Hub `evoapicloud`. Motivo: o fork da Apia precisa de imagem
+# propria para receber customizacoes (session isolation D1-D10, modulo
+# financeiro futuro) sem contaminar a imagem oficial do upstream.
+#
+# Mudancas em relacao ao upstream:
+#   - REGISTRY:   docker.io        -> ghcr.io
+#   - NAMESPACE:  evoapicloud      -> apiaamb
+#   - Login:      DOCKERHUB_TOKEN  -> GITHUB_TOKEN (builtin, zero secrets)
+#   - Permission: + packages: write (necessario para GHCR push)
+#
+# Imagens publicadas:
+#   ghcr.io/apiaamb/evo-nexus-runtime:latest
+#   ghcr.io/apiaamb/evo-nexus-dashboard:latest
+#
+# Para apontar o Swarm Apia para essas imagens:
+#   docker service update --image ghcr.io/apiaamb/evo-nexus-dashboard:latest evonexus_evonexus_dashboard
+# ============================================================================
+
 name: Build & Publish Docker Images (Swarm)
 
 # Builds evo-nexus-runtime and evo-nexus-dashboard images using the
@@ -23,8 +46,8 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: docker.io
-  NAMESPACE: evoapicloud
+  REGISTRY: ghcr.io
+  NAMESPACE: apiaamb
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
@@ -33,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -54,13 +78,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         if: github.event_name != 'workflow_dispatch'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels)
         id: meta

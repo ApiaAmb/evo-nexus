@@ -58,6 +58,40 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
+# Headers from the CLIENT that must never reach the terminal-server (D2).
+# Any header with this prefix is stripped from client request and re-injected
+# with the value resolved from the authenticated Flask session.
+_FORBIDDEN_CLIENT_HEADER_PREFIXES = ("x-evonexus-",)
+
+
+def _strip_client_identity(headers: dict[str, str]) -> dict[str, str]:
+    """Remove any X-EvoNexus-* headers supplied by the client (D2).
+
+    These are controlled by the proxy only. Stripping prevents privilege
+    escalation where a client forges X-EvoNexus-User-Id: 1.
+    Logs a warning with the removed header names for audit trail.
+    """
+    removed = [k for k in headers if any(k.lower().startswith(p) for p in _FORBIDDEN_CLIENT_HEADER_PREFIXES)]
+    if removed:
+        log.warning(
+            "terminal_proxy: stripped client-supplied identity headers: %s (user=%s, path=%s)",
+            removed,
+            getattr(current_user, "id", None),
+            request.path,
+        )
+    return {k: v for k, v in headers.items() if k not in removed}
+
+
+def _inject_identity(headers: dict[str, str], user) -> dict[str, str]:
+    """Inject authenticated user identity into outgoing headers (D1/D2).
+
+    This is the ONLY source of X-EvoNexus-User-Id seen by the terminal-server.
+    Must always be called AFTER _strip_client_identity on the same headers dict.
+    """
+    headers["X-EvoNexus-User-Id"] = str(user.id)
+    headers["X-EvoNexus-User-Role"] = user.role
+    return headers
+
 
 def _forward_headers(src: dict[str, str]) -> dict[str, str]:
     """Strip hop-by-hop headers before forwarding either direction."""
@@ -80,11 +114,16 @@ def proxy_http(subpath: str = ""):
     if request.query_string:
         target = f"{target}?{request.query_string.decode('latin-1')}"
 
+    # Build forwarded headers: strip hop-by-hop AND strip+inject identity (D2).
+    fwd_headers = _forward_headers(dict(request.headers))
+    fwd_headers = _strip_client_identity(fwd_headers)
+    fwd_headers = _inject_identity(fwd_headers, current_user)
+
     try:
         upstream = requests.request(
             method=request.method,
             url=target,
-            headers=_forward_headers(dict(request.headers)),
+            headers=fwd_headers,
             data=request.get_data(),
             allow_redirects=False,
             stream=True,
@@ -155,7 +194,18 @@ def register_websocket_proxy(sock) -> None:
 
         target = f"{TERMINAL_WS_BASE}/ws"
         try:
-            upstream = create_connection(target, timeout=10)
+            # Inject authenticated identity into the server→server upgrade (D1).
+            # The browser cannot set arbitrary headers on WebSocket upgrade;
+            # only the Flask proxy can. This is the SOLE source of truth for
+            # the terminal-server's knowledge of which user owns this WS connection.
+            upstream = create_connection(
+                target,
+                timeout=10,
+                header=[
+                    f"X-EvoNexus-User-Id: {current_user.id}",
+                    f"X-EvoNexus-User-Role: {current_user.role}",
+                ],
+            )
         except Exception as exc:
             log.warning("terminal_proxy: upstream WS connect failed: %s", exc)
             try:

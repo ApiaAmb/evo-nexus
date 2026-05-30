@@ -11,6 +11,21 @@ const SessionStore = require('./utils/session-store');
 const ChatLogger = require('./utils/chat-logger');
 const { loadProviderConfig, getProviderMode } = require('./provider-config');
 
+// WS message types that mutate server state.
+// During migration mode (migrationLockActive) these are blocked with a
+// {type:'maintenance'} response. Add new mutating types here when introduced.
+const MUTATING_WS_MESSAGE_TYPES = new Set([
+  'subscribe_global',
+  'unsubscribe_global',
+  'join_session',
+  'leave_session',
+  'start_claude',
+  'input',
+  'chat_send',
+  'chat_stop',
+  'permission_response',
+]);
+
 class TerminalServer {
   constructor(options = {}) {
     this.port = options.port || 32352;
@@ -29,7 +44,9 @@ class TerminalServer {
     this.app = express();
     this.claudeSessions = new Map();
     this.webSocketConnections = new Map();
-    this.globalSubscribers = new Set(); // wsIds subscribed to global notifications
+    // D9: Map<wsId, ownerUserId> — stores subscriber identity for owner-filtered broadcasts
+    this.globalSubscribers = new Map();
+    this.migrationLockActive = false; // D6: set true during migration janela
     this.claudeBridge = new ClaudeBridge();
     this.chatBridge = new ChatBridge();
     this.sessionStore = new SessionStore({ sessionTtlMs: this.sessionTtlMs });
@@ -54,6 +71,25 @@ class TerminalServer {
 
   async loadPersistedSessions() {
     try {
+      // D6: detect legacy layout and auto-migrate before serving any request
+      const needsMigration = await this.sessionStore.needsMigration();
+      if (needsMigration) {
+        const adminUserId = process.env.ADMIN_USER_ID || '1';
+        console.log(`[loadPersistedSessions] Legacy layout detected — auto-migrating to users/${adminUserId}/`);
+        try {
+          await this.enterMigrationMode();
+          const { migrate } = require('./scripts/migrate-session-ownership');
+          const result = await migrate({
+            storageDir: this.sessionStore.storageDir,
+            adminUserId,
+            logsRoot: this.chatLogger.logsRoot,
+          });
+          console.log('[loadPersistedSessions] Migration result:', JSON.stringify(result));
+        } finally {
+          await this.exitMigrationMode();
+        }
+      }
+
       const sessions = await this.sessionStore.loadSessions();
       this.claudeSessions = sessions;
       if (sessions.size > 0) {
@@ -87,7 +123,41 @@ class TerminalServer {
   }
 
   async saveSessionsToDisk() {
+    // D6: no-op during migration window — prevents concurrent writes with migrate script
+    if (this.migrationLockActive) return;
     await this.sessionStore.saveSessions(this.claudeSessions);
+  }
+
+  async enterMigrationMode() {
+    this.migrationLockActive = true;
+
+    // D6 (HIGH-1.a): pause GC — it iterates claudeSessions and may remove entries
+    // mid-migration, corrupting the output
+    if (this.sessionGcInterval) {
+      clearInterval(this.sessionGcInterval);
+      this.sessionGcInterval = null;
+    }
+
+    // D6 (L-4): notify open WS connections about maintenance
+    for (const [, wsInfo] of this.webSocketConnections) {
+      if (wsInfo.ws.readyState === WebSocket.OPEN) {
+        this.sendToWebSocket(wsInfo.ws, {
+          type: 'maintenance',
+          message: 'Sistema em manutencao, reconecte em 5 minutos.',
+        });
+      }
+    }
+  }
+
+  async exitMigrationMode() {
+    this.migrationLockActive = false;
+
+    // D6 (HIGH-1.a): restart GC with same interval
+    if (this.sessionGcIntervalMs > 0 && !this.sessionGcInterval) {
+      this.sessionGcInterval = setInterval(() => {
+        void this.purgeStaleSessions();
+      }, this.sessionGcIntervalMs);
+    }
   }
 
   _checkPathAccess(targetPath, requireWrite = false) {
@@ -256,6 +326,39 @@ class TerminalServer {
     this.app.use(cors());
     this.app.use(express.json());
 
+    // D2/D7: Identity middleware — must be first among /api/* handlers.
+    // Reads X-EvoNexus-User-Id injected by the Flask proxy (never trusted from
+    // the browser directly). If the header is absent and isolation is enforced,
+    // returns 401. Populates req.ownerUserId for downstream route handlers.
+    this.app.use('/api', (req, res, next) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
+      const userId = req.headers['x-evonexus-user-id'];
+      if (!userId) {
+        if (enforceIsolation) {
+          console.error(JSON.stringify({
+            event: 'missing_auth_header',
+            ts: new Date().toISOString(),
+            path: req.path,
+            isolation_enabled: enforceIsolation,
+          }));
+          return res.status(401).json({ error: 'missing identity header' });
+        }
+        // Kill switch off: pass through without owner binding
+        req.ownerUserId = null;
+        return next();
+      }
+      req.ownerUserId = userId;
+      next();
+    });
+
+    // D6: Maintenance mode — block HTTP mutations during migration window.
+    this.app.use('/api', (req, res, next) => {
+      if (this.migrationLockActive && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        return res.status(503).json({ error: 'maintenance', retry_after_seconds: 300 });
+      }
+      next();
+    });
+
     this.app.get('/api/health', (req, res) => {
       const snapshot = this.getHealthSnapshot(false);
       res.status(snapshot.status === 'error' ? 503 : 200).json(snapshot);
@@ -273,9 +376,15 @@ class TerminalServer {
         return res.status(400).json({ error: 'agentName is required' });
       }
 
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
+
       // Scope reuse by (agentName, ticketId) when ticketId is provided.
       // Without ticketId the old behaviour is preserved (reuse by agentName alone).
+      // D3: Only reuse sessions owned by this user.
       for (const [id, s] of this.claudeSessions.entries()) {
+        if (enforceIsolation && req.ownerUserId && String(s.ownerUserId) !== String(req.ownerUserId)) {
+          continue; // Skip sessions owned by other users
+        }
         const agentMatch = s.agentName === agentName;
         const ticketMatch = ticketId ? s.ticketId === ticketId : !s.ticketId;
         if (agentMatch && ticketMatch) {
@@ -316,6 +425,7 @@ class TerminalServer {
         active: false,
         agent: null,
         agentName,
+        ownerUserId: req.ownerUserId || null, // D1: bind to authenticated user
         ticketId: ticketId || null,
         systemPromptExtras: systemPromptExtras || null,
         workingDir: validWorkingDir,
@@ -343,9 +453,14 @@ class TerminalServer {
 
     // List all sessions for a given agent
     this.app.get('/api/sessions/by-agent/:agentName', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const { agentName } = req.params;
       const sessions = [];
       for (const [id, s] of this.claudeSessions.entries()) {
+        // D3: filter by owner — user sees only their own sessions
+        if (enforceIsolation && req.ownerUserId && String(s.ownerUserId) !== String(req.ownerUserId)) {
+          continue;
+        }
         if (s.agentName === agentName) {
           // Build preview and find last message timestamp
           let preview = '';
@@ -412,6 +527,7 @@ class TerminalServer {
         active: false,
         agent: null,
         agentName,
+        ownerUserId: req.ownerUserId || null, // D1: bind to authenticated user
         workingDir: validWorkingDir,
         connections: new Set(),
         outputBuffer: [],
@@ -434,8 +550,32 @@ class TerminalServer {
     });
 
     this.app.get('/api/sessions/:sessionId', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const session = this.claudeSessions.get(req.params.sessionId);
-      if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (!session) {
+        if (enforceIsolation) {
+          console.error(JSON.stringify({
+            event: 'session_not_found',
+            ts: new Date().toISOString(),
+            requested_owner: req.ownerUserId,
+            session_id: req.params.sessionId,
+            path: '/api/sessions/:id',
+          }));
+        }
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      // D3: return 404 (not 403) to avoid leaking session existence to wrong user
+      if (enforceIsolation && req.ownerUserId && String(session.ownerUserId) !== String(req.ownerUserId)) {
+        console.error(JSON.stringify({
+          event: 'owner_mismatch',
+          ts: new Date().toISOString(),
+          requested_owner: req.ownerUserId,
+          actual_owner: session.ownerUserId,
+          session_id: req.params.sessionId,
+          path: '/api/sessions/:id',
+        }));
+        return res.status(404).json({ error: 'Session not found' });
+      }
       res.json({
         id: session.id,
         name: session.name,
@@ -450,8 +590,13 @@ class TerminalServer {
 
     // Bind a session to a ticket (Feature 1.3 — session binding)
     this.app.post('/api/sessions/:sessionId/ticket', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const session = this.claudeSessions.get(req.params.sessionId);
       if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (enforceIsolation && req.ownerUserId && String(session.ownerUserId) !== String(req.ownerUserId)) {
+        console.error(JSON.stringify({ event: 'owner_mismatch', ts: new Date().toISOString(), requested_owner: req.ownerUserId, actual_owner: session.ownerUserId, session_id: req.params.sessionId, path: '/api/sessions/:id/ticket' }));
+        return res.status(404).json({ error: 'Session not found' });
+      }
       const { ticketId } = req.body || {};
       // ticketId can be null to unbind
       session.ticketId = ticketId || null;
@@ -462,8 +607,13 @@ class TerminalServer {
 
     // Rename or archive a session
     this.app.patch('/api/sessions/:sessionId', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const session = this.claudeSessions.get(req.params.sessionId);
       if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (enforceIsolation && req.ownerUserId && String(session.ownerUserId) !== String(req.ownerUserId)) {
+        console.error(JSON.stringify({ event: 'owner_mismatch', ts: new Date().toISOString(), requested_owner: req.ownerUserId, actual_owner: session.ownerUserId, session_id: req.params.sessionId, path: '/api/sessions/:id PATCH' }));
+        return res.status(404).json({ error: 'Session not found' });
+      }
       const { name, archived } = req.body || {};
       if (name !== undefined) {
         if (typeof name !== 'string' || !name.trim()) {
@@ -485,9 +635,14 @@ class TerminalServer {
     });
 
     this.app.delete('/api/sessions/:sessionId', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const sessionId = req.params.sessionId;
       const session = this.claudeSessions.get(sessionId);
       if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (enforceIsolation && req.ownerUserId && String(session.ownerUserId) !== String(req.ownerUserId)) {
+        console.error(JSON.stringify({ event: 'owner_mismatch', ts: new Date().toISOString(), requested_owner: req.ownerUserId, actual_owner: session.ownerUserId, session_id: sessionId, path: '/api/sessions/:id DELETE' }));
+        return res.status(404).json({ error: 'Session not found' });
+      }
 
       if (session.active) this.claudeBridge.stopSession(sessionId);
 
@@ -506,8 +661,13 @@ class TerminalServer {
 
     // Return all unresolved permission requests across all active sessions
     this.app.get('/api/notifications/pending', (req, res) => {
+      const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
       const notifications = [];
       for (const [sessionId, session] of this.claudeSessions.entries()) {
+        // D10: filter by owner — user only sees their own pending notifications
+        if (enforceIsolation && req.ownerUserId && String(session.ownerUserId) !== String(req.ownerUserId)) {
+          continue;
+        }
         const bridgeSession = this.chatBridge.sessions.get(sessionId);
         if (!bridgeSession?.pendingApprovals) continue;
         for (const [requestId] of bridgeSession.pendingApprovals.entries()) {
@@ -535,7 +695,7 @@ class TerminalServer {
     this.wss.on('connection', (ws, req) => this.handleWebSocketConnection(ws, req));
 
     return new Promise((resolve, reject) => {
-      server.listen(this.port, '0.0.0.0', (err) => {
+      server.listen(this.port, '127.0.0.1', (err) => {
         if (err) return reject(err);
         this.server = server;
         resolve(server);
@@ -548,12 +708,49 @@ class TerminalServer {
     const url = new URL(req.url, 'ws://localhost');
     const claudeSessionId = url.searchParams.get('sessionId');
 
+    // D1.6 [NEW]: read owner identity from upgrade request header injected by Flask proxy
+    const ownerUserId = req.headers['x-evonexus-user-id'] || null;
+    const ownerUserRole = req.headers['x-evonexus-user-role'] || null;
+
+    // D1.6 [NEW]: resolve kill switch
+    const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
+
+    // D1.6 [NEW]: close without auth if isolation is on and header is absent
+    if (enforceIsolation && !ownerUserId) {
+      console.error(JSON.stringify({
+        event: 'missing_auth_header',
+        ts: new Date().toISOString(),
+        path: 'ws_handshake',
+        isolation_enabled: true,
+      }));
+      try { ws.close(4401, 'auth required'); } catch {}
+      return;
+    }
+
+    // D1.6 [NEW]: if session in URL, reject cross-user access before sending anything
+    if (enforceIsolation && ownerUserId && claudeSessionId) {
+      const sess = this.claudeSessions.get(claudeSessionId);
+      if (sess && String(sess.ownerUserId) !== String(ownerUserId)) {
+        console.error(JSON.stringify({
+          event: 'owner_mismatch',
+          ts: new Date().toISOString(),
+          requested_owner: ownerUserId,
+          actual_owner: sess.ownerUserId,
+          session_id: claudeSessionId,
+          path: 'ws_handshake',
+        }));
+        try { ws.close(4403, 'forbidden'); } catch {}
+        return;
+      }
+    }
+
     if (this.dev) console.log(`New WebSocket connection: ${wsId}`);
 
-    const wsInfo = { id: wsId, ws, claudeSessionId: null, created: new Date() };
+    // D1.6 [MODIFIED]: wsInfo now carries ownerUserId + ownerUserRole
+    const wsInfo = { id: wsId, ws, claudeSessionId: null, ownerUserId, ownerUserRole, created: new Date() };
     this.webSocketConnections.set(wsId, wsInfo);
 
-    // Send pending chat history if session is in chat mode
+    // D1.6 [MOVED]: send pending chat history AFTER auth checks (fixes vetor #4)
     if (claudeSessionId) {
       const sess = this.claudeSessions.get(claudeSessionId);
       if (sess?.chatHistory?.length > 0) {
@@ -561,6 +758,7 @@ class TerminalServer {
       }
     }
 
+    // [UNCHANGED] handlers
     ws.on('message', async (message) => {
       try {
         const data = JSON.parse(message);
@@ -592,10 +790,21 @@ class TerminalServer {
     const wsInfo = this.webSocketConnections.get(wsId);
     if (!wsInfo) return;
 
+    // D6 (HIGH-1.b): block mutating WS messages during migration window
+    if (this.migrationLockActive && MUTATING_WS_MESSAGE_TYPES.has(data.type)) {
+      this.sendToWebSocket(wsInfo.ws, { type: 'maintenance', retry_after_seconds: 300 });
+      return;
+    }
+
     switch (data.type) {
-      case 'subscribe_global':
-        this.globalSubscribers.add(wsId);
+      case 'subscribe_global': {
+        // D9: store (wsId → ownerUserId) instead of just wsId
+        const subInfo = this.webSocketConnections.get(wsId);
+        if (subInfo) {
+          this.globalSubscribers.set(wsId, subInfo.ownerUserId);
+        }
         break;
+      }
 
       case 'unsubscribe_global':
         this.globalSubscribers.delete(wsId);
@@ -649,7 +858,7 @@ class TerminalServer {
 
               // Fall back to JSONL scan if cache is cold or uuid not found
               if (cutIdx === -1 && chatSession.agentName) {
-                const fromLog = this.chatLogger.read(chatSession.agentName, wsInfo.claudeSessionId);
+                const fromLog = this.chatLogger.read(wsInfo.ownerUserId, chatSession.agentName, wsInfo.claudeSessionId);
                 cutIdx = fromLog.findIndex(m => m.uuid === rewindUuid);
                 if (cutIdx !== -1) {
                   // Sync cache from JSONL
@@ -681,7 +890,7 @@ class TerminalServer {
               chatSession.chatHistory = chatSession.chatHistory.slice(0, cutIdx);
 
               // 4. Append rewind marker to JSONL
-              this.chatLogger.appendRewindMarker(chatSession.agentName, wsInfo.claudeSessionId, rewindUuid);
+              this.chatLogger.appendRewindMarker(wsInfo.ownerUserId, chatSession.agentName, wsInfo.claudeSessionId, rewindUuid);
             }
             // --- End rewind handling ---
 
@@ -693,7 +902,7 @@ class TerminalServer {
               ts: Date.now(),
             };
             chatSession.chatHistory.push(userMsg);
-            this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, userMsg);
+            this.chatLogger.append(wsInfo.ownerUserId, chatSession.agentName, wsInfo.claudeSessionId, userMsg);
 
             // Accumulate assistant response for history
             let assistantBlocks = [];
@@ -708,6 +917,11 @@ class TerminalServer {
                 sdkSessionId: chatSession.sdkSessionId || undefined,
                 systemPromptExtras: chatSession.systemPromptExtras || undefined,
                 onMessage: (msg) => {
+                  // D6 (R-1): drop async callback if migration is active
+                  if (this.migrationLockActive) {
+                    console.error(JSON.stringify({ event: 'callback_dropped_in_migration', ts: new Date().toISOString(), callback: 'onMessage', session_id: wsInfo.claudeSessionId, owner_user_id: wsInfo.ownerUserId }));
+                    return;
+                  }
                   // Track SDK session ID
                   if (msg.type === 'session_id' && msg.sdkSessionId) {
                     chatSession.sdkSessionId = msg.sdkSessionId;
@@ -797,6 +1011,11 @@ class TerminalServer {
                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_event', event: msg });
                 },
                 onError: (err) => {
+                  // D6 (R-1): drop async callback if migration is active
+                  if (this.migrationLockActive) {
+                    console.error(JSON.stringify({ event: 'callback_dropped_in_migration', ts: new Date().toISOString(), callback: 'onError', session_id: wsInfo.claudeSessionId, owner_user_id: wsInfo.ownerUserId }));
+                    return;
+                  }
                   chatSession.active = false;
                   this.broadcastToSession(wsInfo.claudeSessionId, {
                     type: 'chat_error',
@@ -804,6 +1023,11 @@ class TerminalServer {
                   });
                 },
                 onComplete: (info) => {
+                  // D6 (R-1): drop async callback if migration is active
+                  if (this.migrationLockActive) {
+                    console.error(JSON.stringify({ event: 'callback_dropped_in_migration', ts: new Date().toISOString(), callback: 'onComplete', session_id: wsInfo.claudeSessionId, owner_user_id: wsInfo.ownerUserId }));
+                    return;
+                  }
                   chatSession.active = false;
                   // Store SDK session ID for future resume
                   if (info?.sdkSessionId) {
@@ -818,7 +1042,7 @@ class TerminalServer {
                       streaming: false,
                     };
                     chatSession.chatHistory.push(assistantMsg);
-                    this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
+                    this.chatLogger.append(wsInfo.ownerUserId, chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
                   }
                   this.saveSessionsToDisk();
                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_complete' });
@@ -897,6 +1121,21 @@ class TerminalServer {
       return;
     }
 
+    // D3: owner check — cross-user join rejected with close 4403
+    const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
+    if (enforceIsolation && wsInfo.ownerUserId && String(session.ownerUserId) !== String(wsInfo.ownerUserId)) {
+      console.error(JSON.stringify({
+        event: 'owner_mismatch',
+        ts: new Date().toISOString(),
+        requested_owner: wsInfo.ownerUserId,
+        actual_owner: session.ownerUserId,
+        session_id: claudeSessionId,
+        path: 'joinClaudeSession',
+      }));
+      try { wsInfo.ws.close(4403, 'forbidden'); } catch {}
+      return;
+    }
+
     if (wsInfo.claudeSessionId) await this.leaveClaudeSession(wsId);
 
     wsInfo.claudeSessionId = claudeSessionId;
@@ -907,7 +1146,7 @@ class TerminalServer {
     // Restore chat history from JSONL logs if session cache is empty
     let chatHistory = session.chatHistory || [];
     if (chatHistory.length === 0 && session.agentName && session.mode === 'chat') {
-      const restored = this.chatLogger.read(session.agentName, claudeSessionId);
+      const restored = this.chatLogger.read(session.ownerUserId, session.agentName, claudeSessionId);
       if (restored.length > 0) {
         session.chatHistory = restored;
         chatHistory = restored;
@@ -1039,19 +1278,30 @@ class TerminalServer {
   }
 
   /**
-   * Broadcast a notification to all global subscribers.
-   * Skips subscribers that are already watching the originating session
-   * (they see events inline and don't need a global notification).
+   * Broadcast a notification to global subscribers.
+   * D9: Only sends to subscribers that own the same session as the origin.
+   * Skips subscribers already watching the originating session inline.
    *
    * @param {object} data - Notification payload
-   * @param {string} [originSessionId] - Session that generated the event (used for suppression)
+   * @param {string} [originSessionId] - Session that generated the event (used for owner resolution + suppression)
    */
   broadcastToGlobalSubscribers(data, originSessionId) {
-    for (const wsId of this.globalSubscribers) {
+    const enforceIsolation = process.env.SESSION_ISOLATION_ENABLED !== 'false';
+    let originOwner = null;
+    if (enforceIsolation && originSessionId) {
+      const originSess = this.claudeSessions.get(originSessionId);
+      if (originSess) originOwner = originSess.ownerUserId;
+    }
+    // D9: globalSubscribers is now Map<wsId, ownerUserId>
+    for (const [wsId, subscriberOwner] of this.globalSubscribers) {
       const wsInfo = this.webSocketConnections.get(wsId);
       if (!wsInfo || wsInfo.ws.readyState !== WebSocket.OPEN) continue;
       // Suppress if this subscriber is already watching the origin session
       if (originSessionId && wsInfo.claudeSessionId === originSessionId) continue;
+      // D9: filter by owner — only send to subscribers that own the same session
+      if (enforceIsolation && originOwner !== null && String(subscriberOwner) !== String(originOwner)) {
+        continue;
+      }
       this.sendToWebSocket(wsInfo.ws, data);
     }
   }

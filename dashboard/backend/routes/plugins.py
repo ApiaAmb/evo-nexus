@@ -1021,7 +1021,7 @@ def install_plugin():
         _declared_mcp_servers = manifest.get("mcp_servers") or []
         if _declared_mcp_servers:
             try:
-                from plugin_claude_config import add_mcp_servers
+                from plugin_claude_config import add_mcp_servers, run_in_threadpool
                 from plugin_install_state import all_plugin_mcp_names
                 # Pre-install collision check
                 _existing_mcp_names = all_plugin_mcp_names(DB_PATH)
@@ -1032,8 +1032,8 @@ def install_plugin():
                             f"MCP name collision: effective name '{_eff}' is already "
                             "registered by another installed plugin."
                         )
-                mcp_installed_records = add_mcp_servers(
-                    slug, _declared_mcp_servers, workspace=WORKSPACE
+                mcp_installed_records = run_in_threadpool(
+                    add_mcp_servers, slug, _declared_mcp_servers, workspace=WORKSPACE
                 )
             except Exception as exc:
                 raise RuntimeError(f"MCP server injection failed: {exc}") from exc
@@ -1269,11 +1269,11 @@ def uninstall_plugin(slug: str):
         # Wave 2.3: remove MCP servers from ~/.claude.json before removing plugin dir
         _mcp_audit: dict = {}
         try:
-            from plugin_claude_config import remove_mcp_servers
+            from plugin_claude_config import remove_mcp_servers, run_in_threadpool
             from plugin_install_state import get_plugin_mcp_servers
             _mcp_records = get_plugin_mcp_servers(slug, DB_PATH)
             if _mcp_records:
-                _mcp_audit = remove_mcp_servers(slug, _mcp_records)
+                _mcp_audit = run_in_threadpool(remove_mcp_servers, slug, _mcp_records)
                 logger.info("Uninstall MCP audit for '%s': %s", slug, _mcp_audit)
         except Exception as exc:
             logger.warning("MCP removal failed during uninstall of '%s': %s", slug, exc)
@@ -2665,12 +2665,13 @@ def update_plugin(slug: str):
         from plugin_install_state import get_plugin_mcp_servers as _get_plugin_mcp_servers
         mcp_delta_result: dict = {}
         try:
-            from plugin_claude_config import apply_mcp_delta
+            from plugin_claude_config import apply_mcp_delta, run_in_threadpool
             _old_mcp_servers = installed_manifest_dict.get("mcp_servers") or []
             _new_mcp_servers = (new_manifest.model_dump().get("mcp_servers") or [])
             _old_mcp_installed = _get_plugin_mcp_servers(slug, DB_PATH)
             if _old_mcp_servers or _new_mcp_servers:
-                mcp_delta_result = apply_mcp_delta(
+                mcp_delta_result = run_in_threadpool(
+                    apply_mcp_delta,
                     slug,
                     _old_mcp_servers,
                     _new_mcp_servers,

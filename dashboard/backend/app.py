@@ -849,6 +849,7 @@ from routes.knowledge_proxy import bp as knowledge_proxy_bp
 from routes.knowledge_v1 import bp as knowledge_v1_bp
 from routes.databases import bp as databases_bp
 from routes.plugins import bp as plugins_bp
+from routes.finance import bp as finance_bp
 from routes.mcp_servers import bp as mcp_servers_bp
 
 # Brain Repo + Onboarding blueprints (loaded after routes are created)
@@ -899,7 +900,7 @@ app.register_blueprint(terminal_proxy_bp)
 try:
     from flask_sock import Sock as _Sock
     _terminal_sock = _Sock(app)
-    _register_terminal_ws(_terminal_sock)
+    _register_terminal_ws(_terminal_sock, is_production=_is_production())
 except Exception as _exc:
     import logging as _logging
     _logging.getLogger(__name__).warning(
@@ -921,6 +922,7 @@ app.register_blueprint(knowledge_proxy_bp)
 app.register_blueprint(knowledge_v1_bp)
 app.register_blueprint(databases_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(finance_bp)
 app.register_blueprint(mcp_servers_bp)
 
 # --------------- Social Auth blueprints ---------------
@@ -1058,6 +1060,73 @@ def serve_frontend(path):
     return {"error": "Frontend not built. Run npm build in frontend/"}, 404
 
 
+# ---------------------------------------------------------------------------
+# Task-poller — realocado para top-level (Raven r2 C-3.b).
+#
+# Sob gunicorn + GeventWebSocketWorker, o bloco `if __name__ == "__main__":`
+# é skipped — o task-poller nunca iniciava, matando silenciosamente as
+# ScheduledTasks. Extração para top-level + init_task_poller() idempotente
+# corrige isso para ambos os entrypoints (gunicorn e python app.py).
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_task_poller_started = False  # guard idempotente — protege contra chamadas duplas
+
+
+def _run_pending_tasks():
+    """Verifica tarefas agendadas pendentes e as executa."""
+    from datetime import datetime as _dt, timezone as _tz
+    from models import ScheduledTask
+
+    try:
+        now = _dt.now(_tz.utc)
+        pending = ScheduledTask.query.filter(
+            ScheduledTask.status == "pending",
+            ScheduledTask.scheduled_at <= now,
+        ).all()
+
+        for task in pending:
+            log_path = WORKSPACE / "ADWs" / "logs" / "scheduler.log"
+            with open(log_path, "a") as _log:
+                _log.write(f"  [{_dt.now().strftime('%H:%M')}] Running scheduled task #{task.id}: {task.name}\n")
+
+            t = _threading.Thread(target=_execute_task_with_context, args=(task.id,), daemon=True)
+            t.start()
+    except Exception:
+        pass
+
+
+def _execute_task_with_context(task_id):
+    with app.app_context():
+        from routes.tasks import _execute_task
+        _execute_task(task_id)
+
+
+def _poll_scheduled_tasks(_app):
+    """Lightweight loop que só polla ScheduledTask — sem agendamento de rotinas."""
+    import time as _time
+    while True:
+        with _app.app_context():
+            _run_pending_tasks()
+        _time.sleep(30)
+
+
+def init_task_poller(_app):
+    """Inicia o thread de polling de tarefas (idempotente — seguro chamar 2x)."""
+    global _task_poller_started
+    if _task_poller_started:
+        return
+    _task_poller_started = True
+    task_thread = _threading.Thread(
+        target=_poll_scheduled_tasks,
+        args=(_app,),
+        daemon=True,
+        name="task-poller",
+    )
+    task_thread.start()
+
+
 if __name__ == "__main__":
     # Read port from workspace.yaml or env, fallback to 8080
     port = int(os.environ.get("EVONEXUS_PORT", 8080))
@@ -1073,47 +1142,8 @@ if __name__ == "__main__":
         pass
     # Scheduler runs as a standalone process (scheduler.py) started by start-services.sh.
     # A thread here would create a duplicate instance — all routines would fire 2-3x.
-    # One-off scheduled tasks (ScheduledTask model) are checked by the standalone scheduler
-    # via _run_pending_tasks, which is called from its own loop.
-    import threading
-
-    def _run_pending_tasks():
-        """Check for pending scheduled tasks and execute them."""
-        from datetime import datetime as _dt, timezone as _tz
-        from models import ScheduledTask
-
-        try:
-            now = _dt.now(_tz.utc)
-            pending = ScheduledTask.query.filter(
-                ScheduledTask.status == "pending",
-                ScheduledTask.scheduled_at <= now,
-            ).all()
-
-            for task in pending:
-                log_path = WORKSPACE / "ADWs" / "logs" / "scheduler.log"
-                with open(log_path, "a") as log:
-                    log.write(f"  [{_dt.now().strftime('%H:%M')}] Running scheduled task #{task.id}: {task.name}\n")
-
-                t = threading.Thread(target=_execute_task_with_context, args=(task.id,), daemon=True)
-                t.start()
-        except Exception:
-            pass
-
-    def _execute_task_with_context(task_id):
-        with app.app_context():
-            from routes.tasks import _execute_task
-            _execute_task(task_id)
-
-    def _poll_scheduled_tasks():
-        """Lightweight thread that only polls ScheduledTask — no routine scheduling."""
-        import time as _time
-        while True:
-            with app.app_context():
-                _run_pending_tasks()
-            _time.sleep(30)
-
-    task_thread = threading.Thread(target=_poll_scheduled_tasks, daemon=True, name="task-poller")
-    task_thread.start()
+    # One-off scheduled tasks (ScheduledTask model) são tratadas pelo init_task_poller abaixo.
+    init_task_poller(app)
 
     # Dev mode: EVONEXUS_DEV=1 enables Flask's auto-reloader so edits to
     # dashboard/backend/*.py take effect without a manual restart. Disabled by
